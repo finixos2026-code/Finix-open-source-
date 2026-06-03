@@ -1,0 +1,634 @@
+/*
+ * ╔════════════════════════════════════════════╗
+ * ║         FINIX OS v2.2 — ESP32-C3          ║
+ * ║    Kali Linux Boot Style + Dashboard       ║
+ * ║    SSD1306 128x64 OLED via I2C            ║
+ * ╚════════════════════════════════════════════╝
+ *
+ * Reminder schedule:
+ *  05:00       → Waktunya Olahraga!
+ *  17:45-20:00 → Waktu Belajar
+ *  20:00-21:00 → Waktunya Tidur
+ */
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <esp_bt.h>
+#include <esp_chip_info.h>
+#include <esp_heap_caps.h>
+
+// ─────────────────────────────────────────────
+//  OLED
+// ─────────────────────────────────────────────
+#define OLED_W    128
+#define OLED_H    64
+#define OLED_ADDR 0x3C
+Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
+
+// ─────────────────────────────────────────────
+//  PIN I2C — ESP32-C3 Super Mini
+// ─────────────────────────────────────────────
+#define SDA_PIN 8
+#define SCL_PIN 9
+
+// ─────────────────────────────────────────────
+//  WIFI
+// ─────────────────────────────────────────────
+const char* WIFI_SSID = "MCGOGO";
+const char* WIFI_PASS = "ISI_PASSWORD";
+
+// ─────────────────────────────────────────────
+//  NTP — GMT+7 WIB
+// ─────────────────────────────────────────────
+const char* NTP_SERVER = "pool.ntp.org";
+const long  GMT_OFFSET = 7 * 3600;
+
+// ─────────────────────────────────────────────
+//  REMINDER — definisi jadwal
+//  Tipe: 0=range jam, 1=tepat jam (muncul 1 menit)
+// ─────────────────────────────────────────────
+struct Reminder {
+  uint8_t startH, startM;  // mulai
+  uint8_t endH,   endM;    // selesai (untuk tipe range)
+  const char* icon;        // 4 char maks
+  const char* text;        // maks 14 char
+};
+
+// Semua reminder (di RAM, teksnya pendek)
+static const Reminder reminders[] = {
+  { 5,  0,  5, 10, ">>>", "Ayo Olahraga!" },   // 05:00-05:10
+  { 17,45, 20,  0, "***", "Waktu Belajar" },    // 17:45-20:00
+  { 20,  0, 21,  0, "zzz", "Waktunya Tidur" },  // 20:00-21:00
+};
+#define REMINDER_COUNT 3
+
+// ─────────────────────────────────────────────
+//  KALI LINUX LOGO — 32x32
+// ─────────────────────────────────────────────
+static const unsigned char PROGMEM kali_logo[] = {
+  0x03,0xC0,0x03,0xC0, 0x07,0xE0,0x07,0xE0,
+  0x0F,0xF0,0x0F,0xF0, 0x1F,0xF8,0x1F,0xF8,
+  0x3F,0xFC,0x3F,0xFC, 0x7F,0xFE,0x7F,0xFE,
+  0xFF,0xFF,0xFF,0xFF,  0xFF,0xFF,0xFF,0xFF,
+  0xE7,0xE7,0xE7,0xE7, 0xC3,0xC3,0xC3,0xC3,
+  0xFF,0xFF,0xFF,0xFF,  0xFF,0xFF,0xFF,0xFF,
+  0xFF,0xFF,0xFF,0xFF,  0xF8,0x1F,0xF8,0x1F,
+  0xF0,0x0F,0xF0,0x0F, 0xFF,0xFF,0xFF,0xFF,
+  0xDB,0xDB,0xDB,0xDB, 0xDB,0xDB,0xDB,0xDB,
+  0xFF,0xFF,0xFF,0xFF,  0x7F,0xFE,0x7F,0xFE,
+  0x3F,0xFC,0x3F,0xFC, 0x1F,0xF8,0x1F,0xF8,
+  0x0F,0xF0,0x0F,0xF0, 0x07,0xE0,0x07,0xE0,
+  0x0F,0xF0,0x0F,0xF0, 0x1F,0xF8,0x1F,0xF8,
+  0x3F,0xFC,0x3F,0xFC, 0x7F,0xFE,0x7F,0xFE,
+  0xFF,0xFF,0xFF,0xFF,  0x7E,0x7E,0x7E,0x7E,
+  0x3C,0x3C,0x3C,0x3C, 0x18,0x18,0x18,0x18,
+};
+
+// ─────────────────────────────────────────────
+//  DEBIAN SWIRL — 16x16
+// ─────────────────────────────────────────────
+static const unsigned char PROGMEM debian_logo[] = {
+  0x03,0xC0, 0x0F,0xF0, 0x1C,0x38, 0x30,0x04,
+  0x61,0x02, 0x62,0x02, 0xC4,0x01, 0xC4,0x01,
+  0xC4,0x01, 0x62,0x02, 0x61,0x02, 0x30,0x04,
+  0x1C,0x38, 0x0F,0xF0, 0x03,0xC0, 0x00,0x00,
+};
+
+// ─────────────────────────────────────────────
+//  BOOT LOG — PROGMEM
+// ─────────────────────────────────────────────
+const char b00[] PROGMEM = "FINIX OS v2.2 starting";
+const char b01[] PROGMEM = "Kernel 6.1.0-finix-c3";
+const char b02[] PROGMEM = "[  0.001] RISC-V cpu0 UP";
+const char b03[] PROGMEM = "[  0.012] early con init";
+const char b04[] PROGMEM = "[  0.024] calibrate delay";
+const char b05[] PROGMEM = "[  0.031] NVS flash: OK";
+const char b06[] PROGMEM = "[  0.044] I2C-0: ready";
+const char b07[] PROGMEM = "[  0.058] fb0: SSD1306 OK";
+const char b08[] PROGMEM = "[  0.071] heap alloc: OK";
+const char b09[] PROGMEM = "[  0.085] RTC init: done";
+const char b10[] PROGMEM = "[  0.099] disabling BT..";
+const char b11[] PROGMEM = "[  0.106] BT ctrl: OFF";
+const char b12[] PROGMEM = "[  0.113] BT mem: freed";
+const char b13[] PROGMEM = "[  0.125] net: WiFi STA";
+const char b14[] PROGMEM = "[  0.138] TCP/IP stack UP";
+const char b15[] PROGMEM = "[  0.152] DHCP client ON";
+const char b16[] PROGMEM = "[  0.166] entropy pool OK";
+const char b17[] PROGMEM = "[  0.179] rng: hw seeded";
+const char b18[] PROGMEM = "[  0.192] pm: 80MHz set";
+const char b19[] PROGMEM = "[  0.205] watchdog armed";
+const char b20[] PROGMEM = "[  0.218] reminder: load";
+const char b21[] PROGMEM = "[  0.231] scheduler: RUN";
+const char b22[] PROGMEM = "[  0.244] syslog: ready";
+const char b23[] PROGMEM = "[  0.257] display: ready";
+const char b24[] PROGMEM = "[  0.270] all systems GO";
+const char b25[] PROGMEM = "Reached target: boot OK";
+
+const char* const bootLines[] PROGMEM = {
+  b00,b01,b02,b03,b04,b05,b06,b07,b08,b09,
+  b10,b11,b12,b13,b14,b15,b16,b17,b18,b19,
+  b20,b21,b22,b23,b24,b25
+};
+#define BOOT_COUNT 26
+
+// ─────────────────────────────────────────────
+//  MOTIVASI — PROGMEM
+// ─────────────────────────────────────────────
+const char m0[]  PROGMEM = "Kamu belum gagal.";
+const char m1[]  PROGMEM = "Ini hanya jeda.";
+const char m2[]  PROGMEM = "Ada yang bangga";
+const char m3[]  PROGMEM = "padamu diam-diam.";
+const char m4[]  PROGMEM = "Capek itu tanda";
+const char m5[]  PROGMEM = "kamu sudah berjuang.";
+const char m6[]  PROGMEM = "Hari ini pun";
+const char m7[]  PROGMEM = "kamu bertahan.";
+const char m8[]  PROGMEM = "Jangan banding-";
+const char m9[]  PROGMEM = "kan prosesmu.";
+const char m10[] PROGMEM = "Langkah kecil pun";
+const char m11[] PROGMEM = "tetap melangkah.";
+const char* const qLine[] PROGMEM = {
+  m0,m1,m2,m3,m4,m5,m6,m7,m8,m9,m10,m11
+};
+#define QUOTE_PAIRS 6
+
+// ─────────────────────────────────────────────
+//  STATE
+// ─────────────────────────────────────────────
+static bool    wifiOK  = false;
+static bool    ntpOK   = false;
+static int     lastSec = -1;
+
+// ─────────────────────────────────────────────
+//  HELPER: cek apakah waktu masuk range reminder
+//  return index reminder aktif, atau -1
+// ─────────────────────────────────────────────
+int8_t getActiveReminder(uint8_t h, uint8_t m) {
+  for (uint8_t i = 0; i < REMINDER_COUNT; i++) {
+    uint16_t now   = h * 60 + m;
+    uint16_t start = reminders[i].startH * 60 + reminders[i].startM;
+    uint16_t end   = reminders[i].endH   * 60 + reminders[i].endM;
+    if (now >= start && now < end) return (int8_t)i;
+  }
+  return -1;
+}
+
+// ─────────────────────────────────────────────
+//  HELPER: centered text
+// ─────────────────────────────────────────────
+void drawCenter(const char* txt, uint8_t y, uint8_t size = 1) {
+  display.setTextSize(size);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(txt, 0, y, &x1, &y1, &w, &h);
+  display.setCursor((OLED_W - w) / 2, y);
+  display.print(txt);
+}
+
+// ─────────────────────────────────────────────
+//  SPLASH KALI
+// ─────────────────────────────────────────────
+void splashKali() {
+  display.clearDisplay();
+  display.drawBitmap(4, 14, kali_logo, 32, 32, WHITE);
+  display.setTextSize(1);
+  display.setCursor(42, 12);
+  display.print("KALI LINUX");
+  display.setCursor(42, 24);
+  display.print("Rolling dist");
+  display.setCursor(42, 36);
+  display.print("Kernel 6.1.0");
+  display.drawLine(0, 50, 127, 50, WHITE);
+  display.setCursor(6, 54);
+  display.print("\"The quieter you..\"");
+  display.display();
+  delay(2200);
+}
+
+// ─────────────────────────────────────────────
+//  SPLASH FINIX
+// ─────────────────────────────────────────────
+void splashFinix() {
+  display.clearDisplay();
+  display.drawBitmap(108, 22, debian_logo, 16, 16, WHITE);
+  drawCenter("FINIX OS", 6, 2);
+  display.setTextSize(1);
+  drawCenter("v2.2 for ESP32-C3", 28);
+  drawCenter("Built on FreeRTOS", 40);
+  display.drawLine(0, 50, 127, 50, WHITE);
+  drawCenter("Initializing...", 54);
+  display.display();
+  delay(1800);
+}
+
+// ─────────────────────────────────────────────
+//  BOOT LOG
+// ─────────────────────────────────────────────
+void showBootLog() {
+  const uint8_t MAX_VIS = 7;
+  char buf[28];
+  char vis[MAX_VIS][28];
+  uint8_t visCnt = 0;
+  memset(vis, 0, sizeof(vis));
+
+  for (uint8_t i = 0; i < BOOT_COUNT; i++) {
+    strcpy_P(buf, (char*)pgm_read_ptr(&bootLines[i]));
+    buf[27] = '\0';
+
+    if (visCnt < MAX_VIS) {
+      strncpy(vis[visCnt], buf, 27);
+      vis[visCnt][27] = '\0';
+      visCnt++;
+    } else {
+      for (uint8_t j = 0; j < MAX_VIS - 1; j++) memcpy(vis[j], vis[j+1], 28);
+      strncpy(vis[MAX_VIS-1], buf, 27);
+      vis[MAX_VIS-1][27] = '\0';
+    }
+
+    display.clearDisplay();
+    for (uint8_t r = 0; r < visCnt; r++) {
+      display.setTextSize(1);
+      display.setCursor(0, r * 9);
+      display.print(vis[r]);
+    }
+    uint8_t cx = (uint8_t)(strlen(vis[visCnt-1]) * 6);
+    if (cx > 120) cx = 120;
+    display.fillRect(cx, (visCnt-1)*9, 5, 8, WHITE);
+    display.display();
+
+    if (buf[1]==' ' && buf[2]==' ') delay(85);
+    else if (i==0 || i==BOOT_COUNT-1) delay(400);
+    else delay(210);
+  }
+  delay(500);
+}
+
+// ─────────────────────────────────────────────
+//  WIFI
+// ─────────────────────────────────────────────
+bool connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("[ NET ] Connecting...");
+  display.drawLine(0, 9, 127, 9, WHITE);
+  display.setCursor(0, 14);
+  display.printf("SSID: %s", WIFI_SSID);
+  display.display();
+
+  unsigned long t0 = millis();
+  uint8_t dots = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    if (millis() - t0 > 12000) {
+      display.setCursor(0, 38); display.print("[FAIL] No response");
+      display.setCursor(0, 50); display.print("Continuing offline");
+      display.display(); delay(1500);
+      return false;
+    }
+    display.fillRect(0, 26, 128, 10, BLACK);
+    display.setCursor(0, 26); display.print("Auth");
+    for (uint8_t d = 0; d < (dots%12)+1; d++) display.print(".");
+    dots++;
+    display.display(); delay(320);
+  }
+  display.fillRect(0, 38, 128, 26, BLACK);
+  display.setCursor(0, 38); display.print("[OK]  Connected");
+  display.setCursor(0, 50); display.printf("IP: %s", WiFi.localIP().toString().c_str());
+  display.display(); delay(1000);
+  return true;
+}
+
+// ─────────────────────────────────────────────
+//  NTP
+// ─────────────────────────────────────────────
+bool syncNTP() {
+  configTime(GMT_OFFSET, 0, NTP_SERVER);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0); display.print("[ TIME ] NTP sync...");
+  display.drawLine(0, 9, 127, 9, WHITE);
+  display.setCursor(0, 14); display.print(NTP_SERVER);
+  display.display();
+
+  struct tm t;
+  unsigned long t0 = millis();
+  uint8_t dots = 0;
+  while (!getLocalTime(&t)) {
+    if (millis() - t0 > 10000) {
+      display.setCursor(0, 26); display.print("[FAIL] NTP timeout");
+      display.display(); delay(1500);
+      return false;
+    }
+    display.fillRect(0, 26, 128, 10, BLACK);
+    display.setCursor(0, 26); display.print("Wait");
+    for (uint8_t d = 0; d < (dots%8)+1; d++) display.print(".");
+    dots++;
+    display.display(); delay(500);
+  }
+  char tbuf[24];
+  sprintf(tbuf, "%02d:%02d:%02d WIB", t.tm_hour, t.tm_min, t.tm_sec);
+  display.fillRect(0, 26, 128, 20, BLACK);
+  display.setCursor(0, 26); display.print("[OK]  Synced");
+  display.setCursor(0, 38); display.print(tbuf);
+  display.display(); delay(1000);
+  return true;
+}
+
+// ─────────────────────────────────────────────
+//  SYSINFO — 2 halaman x 2.5 detik = 5 detik
+// ─────────────────────────────────────────────
+void showSysInfo() {
+  esp_chip_info_t chip;
+  esp_chip_info(&chip);
+
+  uint32_t heapFree  = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  uint32_t heapTotal = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+  uint8_t  ramPct    = (uint8_t)(((heapTotal-heapFree)*100UL)/heapTotal);
+  uint32_t flashKB   = ESP.getFlashChipSize() / 1024;
+
+  char ipStr[18] = "Offline";
+  if (wifiOK) WiFi.localIP().toString().toCharArray(ipStr, sizeof(ipStr));
+
+  unsigned long upMs = millis();
+  uint8_t upSec = (uint8_t)((upMs/1000UL)%60);
+  uint8_t upMin = (uint8_t)((upMs/60000UL)%60);
+
+  unsigned long showUntil = millis() + 5000;
+  bool          page      = false;
+  unsigned long lastFlip  = millis();
+
+  while (millis() < showUntil) {
+    if (millis() - lastFlip >= 2500) { page = !page; lastFlip = millis(); }
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print(!page ? "[ HW ] Hardware Info" : "[ SW ] Software Info");
+    display.drawLine(0, 9, 127, 9, WHITE);
+
+    if (!page) {
+      display.setCursor(0, 12); display.print("CHIP: ESP32-C3 RISC-V");
+      display.setCursor(0, 22); display.printf("CORE:%d REV:%d %dMHz",
+                                chip.cores, chip.revision, ESP.getCpuFreqMHz());
+      display.setCursor(0, 32); display.printf("RAM : %luKB/%luKB",
+                                heapFree/1024, heapTotal/1024);
+      display.setCursor(0, 42); display.print("USE [");
+      uint8_t fill = (uint8_t)((ramPct*38UL)/100);
+      display.fillRect(24,43,fill,6,WHITE);
+      display.drawRect(24,43,38,6,WHITE);
+      display.setCursor(64,42); display.printf("]%d%%", ramPct);
+      display.setCursor(0, 54); display.printf("FLSH: %luKB", flashKB);
+    } else {
+      display.setCursor(0, 12); display.print("OS  : FINIX v2.2");
+      display.setCursor(0, 22); display.printf("WIFI: %s", wifiOK ? "ON":"OFF");
+      if (wifiOK) { display.setCursor(60,22); display.printf("(%ddBm)",WiFi.RSSI()); }
+      display.setCursor(0, 32); display.print("BT  : OFF (disabled)");
+      display.setCursor(0, 42); display.print("IP  : "); display.print(ipStr);
+      display.setCursor(0, 54); display.printf("NTP:%s UP:%02dm%02ds",
+                                ntpOK?"OK":"--", upMin, upSec);
+    }
+
+    // Dot indikator
+    display.fillCircle(!page?118:124, 4, 2, WHITE);
+    display.drawCircle(!page?118:124, 4, 2, WHITE);
+    display.fillCircle(!page?124:118, 4, 2, BLACK);
+    display.drawCircle(!page?124:118, 4, 2, WHITE);
+
+    display.display();
+    delay(80);
+  }
+}
+
+// ─────────────────────────────────────────────
+//  AUTH
+// ─────────────────────────────────────────────
+void showAuth() {
+  display.clearDisplay();
+  drawCenter("[ FINIX OS ]", 0);
+  display.drawLine(0, 10, 127, 10, WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 16); display.print("user: root");
+  display.setCursor(0, 28); display.print("auth: PAM_SUCCESS");
+  display.setCursor(0, 40); display.print("sess: opened");
+  display.setCursor(0, 52); display.print("env : loaded");
+  display.display();
+  delay(1800);
+  display.drawRect(4, 56, 120, 7, WHITE);
+  for (uint8_t i = 0; i <= 116; i += 4) {
+    display.fillRect(4, 56, i, 7, WHITE);
+    display.display();
+    delay(18);
+  }
+  delay(300);
+}
+
+// ─────────────────────────────────────────────
+//  MOTIVASI
+// ─────────────────────────────────────────────
+void showMotivation() {
+  char l1[24], l2[24];
+  uint8_t shown[3] = {255,255,255};
+  uint8_t cnt = 0;
+
+  while (cnt < 3) {
+    uint8_t idx = (uint8_t)random(QUOTE_PAIRS);
+    bool dup = false;
+    for (uint8_t i = 0; i < cnt; i++) { if (shown[i]==idx) { dup=true; break; } }
+    if (dup) continue;
+    shown[cnt++] = idx;
+
+    strcpy_P(l1, (char*)pgm_read_ptr(&qLine[idx*2]));
+    strcpy_P(l2, (char*)pgm_read_ptr(&qLine[idx*2+1]));
+    l1[23] = l2[23] = '\0';
+
+    display.clearDisplay();
+    display.setTextSize(1);
+    display.setCursor(0,0); display.print("~ untuk kamu ~");
+    display.drawLine(0,10,127,10,WHITE);
+    display.display(); delay(400);
+    drawCenter(l1, 24); display.display(); delay(600);
+    drawCenter(l2, 36); display.display(); delay(3200);
+  }
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  drawCenter("Kamu cukup.",         16);
+  drawCenter("Kamu layak.",         28);
+  drawCenter("Teruslah berjalan.",  40);
+  display.drawLine(20,52,107,52,WHITE);
+  drawCenter("-- FINIX OS --", 55);
+  display.display();
+  delay(2500);
+}
+
+// ─────────────────────────────────────────────
+//  DASHBOARD — UI diperbaiki
+// ─────────────────────────────────────────────
+void drawDashboard() {
+  struct tm t;
+  if (!getLocalTime(&t)) return;
+  if (t.tm_sec == lastSec) return;
+  lastSec = t.tm_sec;
+
+  const char* days[] = {"SUN","MON","TUE","WED","THU","FRI","SAT"};
+  char timeBuf[10], dateBuf[14];
+  sprintf(timeBuf, "%02d:%02d:%02d", t.tm_hour, t.tm_min, t.tm_sec);
+  sprintf(dateBuf, "%02d/%02d/%04d", t.tm_mday, t.tm_mon+1, t.tm_year+1900);
+
+  // Cek reminder aktif
+  int8_t remIdx = getActiveReminder(t.tm_hour, t.tm_min);
+
+  // Ticker blink: detik genap vs ganjil untuk animasi reminder
+  bool blink = (t.tm_sec % 2 == 0);
+
+  display.clearDisplay();
+
+  // ══ TOPBAR ══
+  // Background topbar (invert untuk kesan bold)
+  display.fillRect(0, 0, 128, 10, WHITE);
+  display.setTextColor(BLACK);
+  display.setTextSize(1);
+
+  // Kiri: nama OS
+  display.setCursor(2, 1);
+  display.print("FINIX OS");
+
+  // Tengah: WiFi
+  display.setCursor(50, 1);
+  if (wifiOK) {
+    int rssi = WiFi.RSSI();
+    if      (rssi > -60) display.print("W[+++]");
+    else if (rssi > -75) display.print("W[++ ]");
+    else                 display.print("W[+  ]");
+  } else {
+    display.print("W[---]");
+  }
+
+  // Kanan: BT + NTP
+  display.setCursor(96, 1);
+  display.print("BT:OFF");
+
+  display.setTextColor(WHITE); // kembalikan warna teks
+
+  // ══ AREA JAM (y: 12-38) ══
+  // Jam besar rata tengah
+  display.setTextSize(2);
+  int16_t x1, y1; uint16_t w, h;
+  display.getTextBounds(timeBuf, 0, 13, &x1, &y1, &w, &h);
+  display.setCursor((OLED_W - w) / 2, 13);
+  display.print(timeBuf);
+
+  // ══ DIVIDER ══
+  display.drawLine(0, 34, 127, 34, WHITE);
+
+  // ══ AREA INFO TENGAH (y: 36-44) ══
+  display.setTextSize(1);
+
+  // Tanggal kiri
+  display.setCursor(0, 36);
+  display.print(dateBuf);
+
+  // Hari kanan
+  display.setCursor(98, 36);
+  display.print(days[t.tm_wday]);
+
+  // ══ DIVIDER TIPIS ══
+  display.drawLine(0, 45, 127, 45, WHITE);
+
+  // ══ STATUS TENGAH (y: 47-54) ══
+  display.setCursor(0, 47);
+  if (wifiOK) {
+    display.printf("IP:%-15s", WiFi.localIP().toString().c_str());
+  } else {
+    display.print("IP: Not connected  ");
+  }
+
+  // ══ DIVIDER BAWAH ══
+  display.drawLine(0, 56, 127, 56, WHITE);
+
+  // ══ TASKBAR BAWAH (y: 57-63) — REMINDER ══
+  display.setCursor(0, 57);
+
+  if (remIdx >= 0) {
+    // Ada reminder aktif — tampilkan dengan blink icon
+    const Reminder& r = reminders[remIdx];
+    if (blink) {
+      // Frame genap: icon + teks
+      display.print(r.icon);
+      display.print(" ");
+      display.print(r.text);
+    } else {
+      // Frame ganjil: invert kotak untuk efek flash
+      display.fillRect(0, 56, 128, 8, WHITE);
+      display.setTextColor(BLACK);
+      display.setCursor(2, 57);
+      display.print(r.icon);
+      display.print(" ");
+      display.print(r.text);
+      display.setTextColor(WHITE);
+    }
+  } else {
+    // Tidak ada reminder: tampilkan RSSI + chip label
+    if (wifiOK) {
+      display.printf("RSSI:%-4ddBm", WiFi.RSSI());
+    } else {
+      display.print("WiFi: OFFLINE  ");
+    }
+    display.setCursor(84, 57);
+    display.print("C3-MINI");
+  }
+
+  display.display();
+}
+
+// ─────────────────────────────────────────────
+//  SETUP
+// ─────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+
+  // Matikan BT 100%
+  btStop();
+  esp_bt_controller_disable();
+  esp_bt_controller_deinit();
+
+  // CPU 80MHz — hemat daya, chip adem
+  setCpuFrequencyMhz(80);
+
+  // I2C + OLED
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(400000);
+
+  if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
+    while (true) delay(500);
+  }
+  display.setTextColor(WHITE);
+  display.cp437(true);
+
+  randomSeed(esp_random());
+
+  // Boot sequence
+  splashKali();
+  splashFinix();
+  showBootLog();
+  wifiOK = connectWiFi();
+  if (wifiOK) ntpOK = syncNTP();
+  showSysInfo();
+  showAuth();
+  showMotivation();
+}
+
+// ─────────────────────────────────────────────
+//  LOOP
+// ─────────────────────────────────────────────
+void loop() {
+  if (wifiOK && WiFi.status() != WL_CONNECTED) WiFi.reconnect();
+  drawDashboard();
+  delay(180);
+}
